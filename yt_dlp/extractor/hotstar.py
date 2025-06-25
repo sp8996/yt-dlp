@@ -27,7 +27,7 @@ class HotStarBaseIE(InfoExtractor):
     def _call_api_v1(self, path, *args, **kwargs):
         return self._download_json(
             f'{self._API_URL}/o/v1/{path}', *args, **kwargs,
-            headers={'x-country-code': 'IN', 'x-platform-code': 'PCTV'})
+            headers={'x-country-code': 'IN', 'x-platform-code': 'web'})
 
     def _call_api_impl(self, path, video_id, query, st=None, cookies=None):
         st = int_or_none(st) or int(time.time())
@@ -45,7 +45,7 @@ class HotStarBaseIE(InfoExtractor):
                     data=json.dumps({'device_ids': [{'id': str(uuid.uuid4()), 'type': 'device_id'}]}).encode(),
                     headers={
                         'hotstarauth': auth,
-                        'x-hs-platform': 'PCTV',  # or 'web'
+                        'x-hs-platform': 'web',  # or 'web'
                         'Content-Type': 'application/json',
                     })['user_identity']
 
@@ -57,12 +57,12 @@ class HotStarBaseIE(InfoExtractor):
         response = self._download_json(
             f'{self._API_URL_V2}/{path}', video_id, query=query,
             headers={
-                'user-agent': 'Disney+;in.startv.hotstar.dplus.tv/23.08.14.4.2915 (Android/13)',
+                'user-agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:139.0) Gecko/20100101 Firefox/139.0',
                 'hotstarauth': auth,
                 'x-hs-usertoken': token,
                 'x-hs-device-id': device_id,
-                'x-hs-client': 'platform:androidtv;app_id:in.startv.hotstar.dplus.tv;app_version:23.08.14.4;os:Android;os_version:13;schema_version:0.0.970',
-                'x-hs-platform': 'androidtv',
+                'x-hs-client': 'platform:web;app_version:25.06.16.0;browser:Firefox;schema_version:0.0.1508;os:Linux;os_version:x86_64;browser_version:139;network_data:unspecified',
+                'x-hs-platform': 'web',
                 'content-type': 'application/json',
             })
 
