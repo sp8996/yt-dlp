@@ -10,7 +10,6 @@ from .common import InfoExtractor
 from ..networking.exceptions import HTTPError
 from ..utils import (
     ExtractorError,
-    OnDemandPagedList,
     determine_ext,
     filter_dict,
     int_or_none,
@@ -48,10 +47,11 @@ class HotStarBaseIE(InfoExtractor):
             'subscriptions', 'in', ..., 'expiry', {parse_iso8601}, all, {max})) or 0
         return expiry > server_time
 
-    def _call_api_v1(self, path, *args, **kwargs):
-        return self._download_json(
-            f'{self._API_URL}/o/v1/{path}', *args, **kwargs,
-            headers={'x-country-code': 'IN', 'x-platform-code': 'PCTV'})
+    def _get_jhs_token(self, video_id, headers):
+        config_url = 'https://www.hotstar.com/api/internal/config?platform=web&filters=all,common,playback,web'
+        config = self._download_json(
+            config_url, video_id, note='Downloading config JSON', fatal=False, headers=headers) or {}
+        return traverse_obj(config, ('data', 'all.feature.video.jhs.player.token'))
 
     def _call_api_impl(self, path, video_id, query, cookies=None, st=None):
         st = int_or_none(st) or int(time.time())
@@ -94,37 +94,6 @@ class HotStarBaseIE(InfoExtractor):
                 'hdcp_version': ['HDCP_V2_2', 'HDCP_V2_1', 'HDCP_V2', 'HDCP_V1'],
             }, separators=(',', ':')),
         }, cookies=cookies, st=st)
-
-    @staticmethod
-    def _parse_metadata_v1(video_data):
-        return traverse_obj(video_data, {
-            'id': ('contentId', {str}),
-            'title': ('title', {str}),
-            'description': ('description', {str}),
-            'duration': ('duration', {int_or_none}),
-            'timestamp': (('broadcastDate', 'startDate'), {int_or_none}, any),
-            'release_year': ('year', {int_or_none}),
-            'channel': ('channelName', {str}),
-            'channel_id': ('channelId', {int}, {str_or_none}),
-            'series': ('showName', {str}),
-            'season': ('seasonName', {str}),
-            'season_number': ('seasonNo', {int_or_none}),
-            'season_id': ('seasonId', {int}, {str_or_none}),
-            'episode': ('title', {str}),
-            'episode_number': ('episodeNo', {int_or_none}),
-        })
-
-    def _fetch_page(self, path, item_id, name, query, root, page):
-        results = self._call_api_v1(
-            path, item_id, note=f'Downloading {name} page {page + 1} JSON', query={
-                **query,
-                'tao': page * self._PAGE_SIZE,
-                'tas': self._PAGE_SIZE,
-            })['body']['results']
-
-        for video in traverse_obj(results, (('assets', None), 'items', lambda _, v: v['contentId'])):
-            yield self.url_result(
-                HotStarIE._video_url(video['contentId'], root=root), HotStarIE, **self._parse_metadata_v1(video))
 
 
 class HotStarIE(HotStarBaseIE):
@@ -173,7 +142,7 @@ class HotStarIE(HotStarBaseIE):
             'episode_number': 8,
         },
         'params': {'skip_download': 'm3u8'},
-    }, {  # Metadata call gets HTTP Error 504 with tas=10000
+    }, {
         'url': 'https://www.hotstar.com/in/shows/anupama/1260022017/anupama-anuj-share-a-moment/1000282843',
         'info_dict': {
             'id': '1000282843',
@@ -213,7 +182,7 @@ class HotStarIE(HotStarBaseIE):
             'channel_id': '1260003991',
         },
         'params': {'skip_download': 'm3u8'},
-    }, {  # Metadata call gets HTTP Error 504 with tas=10000
+    }, {
         'url': 'https://www.hotstar.com/in/clips/e3-sairat-kahani-pyaar-ki/1000262286',
         'info_dict': {
             'id': '1000262286',
@@ -291,25 +260,74 @@ class HotStarIE(HotStarBaseIE):
     def _real_extract(self, url):
         video_id, video_type = self._match_valid_url(url).group('id', 'type')
         video_type = self._TYPE[video_type]
-        cookies = self._get_cookies(url)  # Cookies before any request
+        cookies = self._get_cookies(url)
         if not cookies or not cookies.get(self._TOKEN_NAME):
             self.raise_login_required()
 
-        video_data = traverse_obj(
-            self._call_api_v1(f'{video_type}/detail', video_id, fatal=False, query={
-                'tas': 5,  # See https://github.com/yt-dlp/yt-dlp/issues/7946
-                'contentId': video_id,
-            }), ('body', 'results', 'item', {dict})) or {}
+        # 1. Build the slug for the BFF API
+        path_match = re.search(r'hotstar\.com/([^#?]+)', url)
+        slug = path_match.group(1).strip('/') if path_match else f"in/shows/episode/{video_id}/watch"
+        if not re.match(r'^(?:in|id|my|sg|th|gb|ca)/', slug):
+            slug = f"in/{slug}"
 
-        if video_data.get('drmProtected'):
-            self.report_drm(video_id)
+        headers = {
+            'X-HS-Platform': 'web',
+            'X-Country-Code': 'in',
+            'X-HS-Accept-language': 'eng',
+        }
+
+        # 2. Fetch the config API for the token
+        token = self._get_jhs_token(video_id, headers)
+        if token:
+            headers['x-hs-usertoken'] = token
+
+        # 3. Fetch the BFF API to get the metadata
+        api_url = f"https://www.hotstar.com/api/internal/bff/v2/slugs/{slug}"
+        metadata = self._download_json(api_url, video_id, fatal=False, headers=headers) or {}
+
+        # 4. Extract metadata using traverse_obj
+        title = traverse_obj(metadata, (
+            'page', 'spaces', ..., 'download_button', 'info', 'title_name'
+        ), get_all=False, expected_type=str)
+
+        content_name = traverse_obj(metadata, (
+            'page', 'spaces', ..., 'player_control', 'data', 'content_name'
+        ), get_all=False, expected_type=dict) or {}
+
+        series = content_name.get('title')
+        subtitle = content_name.get('subtitle')
+        description = traverse_obj(metadata, (
+            'page', 'spaces', ..., 'playable_content', 'data', 'description'
+        ), get_all=False, expected_type=str)
+
+        cw_info = traverse_obj(metadata, (
+            'page', 'spaces', ..., 'player_config', 'content_metadata', 'cw_info'
+        ), get_all=False, expected_type=dict) or {}
+        
+        duration = int_or_none(cw_info.get('duration'), scale=1000)
+        timestamp = int_or_none(cw_info.get('timestamp'), scale=1000)
+
+        if not title and subtitle:
+            title = re.sub(r'^S\d+\s+E\d+\s+', '', subtitle)
+        elif not title:
+            title = series or f'hotstar video {video_id}'
+
+        season_number = None
+        episode_number = None
+        if subtitle:
+            mobj = re.search(r'^S(\d+)\s+E(\d+)', subtitle)
+            if mobj:
+                season_number = int_or_none(mobj.group(1))
+                episode_number = int_or_none(mobj.group(2))
+
+        content_type = traverse_obj(metadata, (
+            'page', 'spaces', ..., 'player_config', 'content_metadata', 'content_type'
+        ), get_all=False, expected_type=str) or self._CONTENT_TYPE[video_type]
 
         geo_restricted = False
         formats, subs, has_drm = [], {}, False
-        headers = {'Referer': f'{self._BASE_URL}/in'}
-        content_type = traverse_obj(video_data, ('contentType', {str})) or self._CONTENT_TYPE[video_type]
+        headers_referer = {'Referer': f'{self._BASE_URL}/in'}
 
-        # See https://github.com/yt-dlp/yt-dlp/issues/396
         st = self._request_webpage(
             f'{self._BASE_URL}/in', video_id, 'Fetching server time').get_header('x-origin-date')
         watch = self._call_api_v2('pages/watch', video_id, content_type, cookies, st)
@@ -340,10 +358,10 @@ class HotStarIE(HotStarBaseIE):
             try:
                 if 'package:hls' in tags or ext == 'm3u8':
                     current_formats, current_subs = self._extract_m3u8_formats_and_subtitles(
-                        format_url, video_id, ext='mp4', headers=headers)
+                        format_url, video_id, ext='mp4', headers=headers_referer)
                 elif 'package:dash' in tags or ext == 'mpd':
                     current_formats, current_subs = self._extract_mpd_formats_and_subtitles(
-                        format_url, video_id, headers=headers)
+                        format_url, video_id, headers=headers_referer)
                 elif ext == 'f4m':
                     pass  # XXX: produce broken files
                 else:
@@ -393,11 +411,17 @@ class HotStarIE(HotStarBaseIE):
                 self.raise_no_formats('Your account does not have access to this content', expected=True)
         self._remove_duplicate_formats(formats)
         for f in formats:
-            f.setdefault('http_headers', {}).update(headers)
+            f.setdefault('http_headers', {}).update(headers_referer)
 
         return {
-            **self._parse_metadata_v1(video_data),
             'id': video_id,
+            'title': title,
+            'description': description,
+            'series': series,
+            'season_number': season_number,
+            'episode_number': episode_number,
+            'duration': duration,
+            'timestamp': timestamp,
             'formats': formats,
             'subtitles': subs,
         }
@@ -426,11 +450,9 @@ class HotStarPrefixIE(InfoExtractor):
         'url': 'hotstar:episode:1000234847',
         'only_matching': True,
     }, {
-        # contentData
         'url': 'hotstar:sports:1260065956',
         'only_matching': True,
     }, {
-        # contentData
         'url': 'hotstar:sports:1260066104',
         'only_matching': True,
     }]
@@ -442,7 +464,7 @@ class HotStarPrefixIE(InfoExtractor):
 
 class HotStarSeriesIE(HotStarBaseIE):
     IE_NAME = 'hotstar:series'
-    _VALID_URL = r'(?P<url>https?://(?:www\.)?hotstar\.com(?:/in)?/(?:tv|shows)/[^/]+/(?P<id>\d+))/?(?:[#?]|$)'
+    _VALID_URL = r'(?P<url>https?://(?:www\.)?hotstar\.com(?:/(?P<country>in|id|my|sg|th|gb|ca))?/(?:tv|shows)/[^/]+/(?P<id>\d+))/?(?:[#?]|$)'
     _TESTS = [{
         'url': 'https://www.hotstar.com/in/tv/radhakrishn/1260000646',
         'info_dict': {
@@ -461,22 +483,65 @@ class HotStarSeriesIE(HotStarBaseIE):
             'id': '435',
         },
         'playlist_mincount': 267,
-    }, {  # HTTP Error 504 with tas=10000 (possibly because total size is over 1000 items?)
+    }, {
         'url': 'https://www.hotstar.com/in/shows/anupama/1260022017/',
         'info_dict': {
             'id': '1260022017',
         },
         'playlist_mincount': 1601,
     }]
-    _PAGE_SIZE = 100
 
     def _real_extract(self, url):
-        url, series_id = self._match_valid_url(url).group('url', 'id')
-        eid = self._call_api_v1(
-            'show/detail', series_id, query={'contentId': series_id})['body']['results']['item']['id']
+        mobj = self._match_valid_url(url)
+        url, series_id, country = mobj.group('url', 'id', 'country')
+        country = country or 'in'
 
-        entries = OnDemandPagedList(functools.partial(
-            self._fetch_page, 'tray/g/1/items', series_id,
-            'series', {'etid': 0, 'eid': eid}, url), self._PAGE_SIZE)
+        path_match = re.search(r'hotstar\.com/([^#?]+)', url)
+        path = path_match.group(1).strip('/') if path_match else f"shows/series/{series_id}"
+        
+        if not re.match(r'^(?:in|id|my|sg|th|gb|ca)/', path):
+            path = f"{country}/{path}"
+        slug = path
+
+        headers = {
+            'X-HS-Platform': 'web',
+            'X-Country-Code': country,
+            'X-HS-Accept-language': 'eng',
+        }
+
+        token = self._get_jhs_token(series_id, headers)
+        if token:
+            headers['x-hs-usertoken'] = token
+
+        api_url = f"https://www.hotstar.com/api/internal/bff/v2/slugs/{slug}"
+        metadata = self._download_json(
+            api_url, series_id, note='Downloading series metadata', headers=headers)
+
+        def extract_episodes(node):
+            if isinstance(node, dict):
+                if node.get('name') == 'PlayableContentWidget' and isinstance(node.get('data'), dict):
+                    yield node['data']
+                else:
+                    for v in node.values():
+                        yield from extract_episodes(v)
+            elif isinstance(node, list):
+                for item in node:
+                    yield from extract_episodes(item)
+
+        entries = []
+        seen = set()
+        for data in extract_episodes(metadata):
+            content_id = data.get('content_id')
+            if not content_id or content_id in seen:
+                continue
+            seen.add(content_id)
+            
+            ep_slug = traverse_obj(data, ('actions', 'on_click', ..., 'page_navigation', 'page_slug'), get_all=False)
+            if ep_slug and isinstance(ep_slug, str):
+                ep_url = f"https://www.hotstar.com{ep_slug.split('?')[0]}"
+            else:
+                ep_url = f"https://www.hotstar.com/{country}/shows/episode/{content_id}/watch"
+                
+            entries.append(self.url_result(ep_url, ie='HotStar', video_id=str(content_id)))
 
         return self.playlist_result(entries, series_id)
